@@ -19,19 +19,22 @@ import (
 // For real services, prefer NewServer(deps).Mux() so you can pass a DB,
 // logger, config, etc. into the handlers.
 func NewMux() *http.ServeMux {
-	return NewServer(nil).Mux()
+	return NewServer(NewMemoryStore()).Mux()
 }
 
 // Server holds the dependencies your handlers need. Add fields as you go:
 // db *sql.DB, log *slog.Logger, cfg *Config, etc.
 type Server struct {
-	// deps placeholder — fill in as the service grows.
+	store Store
 }
 
 // NewServer constructs a Server. Pass nil for the scaffold; pass real
 // dependencies for a real service.
-func NewServer(_ any) *Server {
-	return &Server{}
+func NewServer(store Store) *Server {
+	if store == nil {
+		store = NewMemoryStore()
+	}
+	return &Server{store: store}
 }
 
 // Mux returns the HTTP mux with all routes registered.
@@ -39,8 +42,32 @@ func (s *Server) Mux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.healthz)
 	mux.HandleFunc("/readyz", s.readyz)
-	mux.HandleFunc("/", s.index)
+	mux.HandleFunc("/v1/aliases", s.v1Aliases)
+	mux.HandleFunc("/", s.routeRoot)
 	return mux
+}
+
+// v1Aliases routes /v1/aliases to CreateAlias (POST) or GetAliases (GET)
+// based on the request method.
+func (s *Server) v1Aliases(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		s.CreateAlias(w, r)
+	case http.MethodGet:
+		s.GetAliases(w, r)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// routeRoot dispatches / and /<alias_url>. The root path serves the
+// service banner; any other path is treated as a short-URL redirect.
+func (s *Server) routeRoot(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/" {
+		s.index(w, r)
+		return
+	}
+	s.Redirect(w, r)
 }
 
 // healthz returns 200 as long as the process is alive. Used by load
