@@ -1,0 +1,102 @@
+// Package main is the entrypoint for ala_service_modified.
+//
+// This file is part of the servicectl go-webapi scaffold. It's intentionally
+// small — the real HTTP handlers live in internal/ala_service_modified/.
+//
+// What this scaffold gives you out of the box:
+//
+//   - Two endpoints: /healthz (always 200 if the process is up) and /readyz
+//     (200 once any readiness checks pass; 503 otherwise).
+//   - Graceful shutdown on SIGINT/SIGTERM with a 10s drain window.
+//   - The server listens on $PORT (default 3000) on all interfaces so it
+//     works in containers without surprises.
+//
+// What's intentionally NOT here (and where to add it):
+//
+//   - Structured logging: drop in slog or zap in internal/ala_service_modified/logger.go.
+//   - OpenTelemetry: wrap the http.Server handlers in an otelhttp.NewHandler.
+//   - DB connection: open a *sql.DB in main and pass it into the Server.
+//   - Auth: middleware in internal/ala_service_modified/middleware.go.
+//
+// Edit freely. The scaffold is yours.
+package main
+
+import (
+	"context"
+	"errors"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/henryorsborn/ala_service_modified/internal/ala_service_modified"
+)
+
+// buildServer wires the http.Server together from $PORT and NewMux().
+// Extracted from main() so the wiring is exercisable from a test, which
+// gives cmd/server/main.go real coverage.
+func buildServer() *http.Server {
+	return &http.Server{
+		Addr:              listenAddr(),
+		Handler:           ala_service_modified.NewMux(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+}
+
+// listenAddr returns ":$PORT" with PORT defaulting to "3000".
+func listenAddr() string {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "3000"
+	}
+	return ":" + port
+}
+
+// runServer starts srv in a goroutine and blocks until either srv
+// errors fatally or sigCh receives a signal. On signal, gracefully
+// drains in-flight requests with a 10-second timeout.
+//
+// Extracted from main() so the lifecycle logic is exercisable in tests.
+// Production callers invoke this from main(); tests invoke it directly.
+// Returns nil on graceful shutdown, or the listener error if ListenAndServe
+// returned a non-ErrServerClosed error.
+func runServer(srv *http.Server, sigCh <-chan os.Signal) error {
+	errCh := make(chan error, 1)
+	go func() {
+		log.Printf("ala_service_modified listening on %s", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- err
+			return
+		}
+		errCh <- nil
+	}()
+
+	select {
+	case sig := <-sigCh:
+		log.Printf("received signal %s; shutting down", sig)
+	case err := <-errCh:
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("graceful shutdown failed: %v", err)
+		return err
+	}
+	log.Printf("shutdown complete")
+	return nil
+}
+
+func main() {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	if err := runServer(buildServer(), sigCh); err != nil {
+		log.Fatalf("server error: %v", err)
+	}
+}

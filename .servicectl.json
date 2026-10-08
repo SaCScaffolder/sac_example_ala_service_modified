@@ -1,0 +1,14 @@
+{
+  "azure_region": "eastus",
+  "ci_provider": "github-actions",
+  "coverage_threshold": 80,
+  "db": "postgres",
+  "deploy_target": "local",
+  "gcp_project_id": null,
+  "gcp_region": "us-central1",
+  "registry": "ghcr",
+  "sac_base_commit": null,
+  "sac_version": "0.1.0",
+  "schema_version": 1,
+  "template": "go-webapi"
+}
