@@ -38,9 +38,10 @@ import (
 // Extracted from main() so the wiring is exercisable from a test, which
 // gives cmd/server/main.go real coverage.
 func buildServer() *http.Server {
+	mux := ala_service_modified.NewMux()
 	return &http.Server{
 		Addr:              listenAddr(),
-		Handler:           ala_service_modified.NewMux(),
+		Handler:           ala_service_modified.CORSHandler(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 }
