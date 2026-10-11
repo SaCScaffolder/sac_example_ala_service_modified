@@ -10,5 +10,6 @@
   "sac_base_commit": null,
   "sac_version": "0.1.0",
   "schema_version": 1,
+  "service_name": "ala_service_modified",
   "template": "go-webapi"
 }
