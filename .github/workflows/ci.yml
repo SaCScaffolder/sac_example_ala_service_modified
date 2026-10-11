@@ -7,9 +7,11 @@ on:
     branches: [main]
 
 # Top-level permissions: grants GITHUB_TOKEN the rights it needs across
-# every job. Without these, publish fails with `name invalid` (because
-# the token doesn't have packages: write, so the push is rejected).
-# Also restricts other scopes so a leaked token can't be repurposed.
+# every job. The publish job pushes to ghcr.io with
+# GITHUB_TOKEN; the image is in the current repo's own package
+# namespace (see "Set image name" step), so GITHUB_TOKEN's repo-level
+# packages: write covers the push. We still keep contents: read for
+# checkouts (no code is written back).
 permissions:
   contents: read
   packages: write
@@ -77,10 +79,24 @@ jobs:
       - name: Set image name
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          echo "IMAGE_NAME=ghcr.io/${OWNER}/ala_service_modified" >> "$GITHUB_ENV"
+          REPO=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+
+          # GHCR *repo-package* format is `ghcr.io/<owner>/<repo>/<image>`.
+          # Without the trailing `/${SERVICE}` segment, the image lands in
+          # the *user/org* package namespace, which GITHUB_TOKEN cannot
+          # write to. See PR #101.
+          echo "IMAGE_NAME=ghcr.io/${OWNER}/${REPO}/ala_service_modified" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
       - name: Build image
-        run: docker build -t $IMAGE_NAME:${{ github.sha }} .
+        run: |
+          # The OCI image.source label is the key to GHCR's auto-link
+          # of freshly-pushed packages to the current repo. See PR #103
+          # and the comment block in the Dockerfile for the full story.
+          docker build \
+            --build-arg IMAGE_SOURCE="https://github.com/${{ github.repository }}" \
+            --build-arg IMAGE_URL="https://github.com/${{ github.repository }}" \
+            -t $IMAGE_NAME:${{ github.sha }} .
       - name: Scan image (Trivy)
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -93,6 +109,9 @@ jobs:
           exit-code: "1"
           ignore-unfixed: true
 
+  # GAR pushes don't use GITHUB_TOKEN; they need GCP auth (WIF or a SA key).
+  # The GAR-aware push path is in deploy/gcp/deploy.yml.j2; users wire that
+  # to workflow_dispatch or push-to-main. See PR #99 for the long form.
   publish:
     name: publish
     runs-on: ubuntu-latest
@@ -102,23 +121,177 @@ jobs:
       - name: Set image name
         run: |
           OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          echo "IMAGE_NAME=ghcr.io/${OWNER}/ala_service_modified" >> "$GITHUB_ENV"
+          REPO=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+
+          # GHCR *repo-package* format is `ghcr.io/<owner>/<repo>/<image>`.
+          # Without the trailing `/${SERVICE}` segment, the image lands in
+          # the *user/org* package namespace, which GITHUB_TOKEN cannot
+          # write to. See PR #101.
+          echo "IMAGE_NAME=ghcr.io/${OWNER}/${REPO}/ala_service_modified" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
       # Build AND push in one job so the image is available on this runner.
       # The earlier design built in the `build` step and tried to push from a
       # separate `publish` job, but cross-runner Docker image handoff isn't
       # supported — the image doesn't exist on a fresh runner.
+
+      # Log in to ghcr.io with the workflow's GITHUB_TOKEN.
+      # The image is in the current repo's own package namespace (see
+      # "Set image name" step), so GITHUB_TOKEN's repo-level
+      # packages: write covers the push. This is the standard
+      # GitHub-supported way to push to ghcr.io — the docs note that
+      # GitHub Packages only supports authentication using a personal
+      # access token (classic) or GITHUB_TOKEN, not GitHub App
+      # installation tokens
+      # (https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry).
+      # The org's "Workflow permissions" setting must be "Read and
+      # write" for GITHUB_TOKEN to carry that scope.
       - name: Log in to ghcr.io
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: "Pre-flight: check for stale mislinked GHCR package"
+        if: ${{ env.IMAGE_NAME }}.startsWith('ghcr.io/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # PR #103: detect a pre-existing org-scoped package that the
+          # current repo's GITHUB_TOKEN can't write to. If a *previous*
+          # run of a *different* (rescaffolded) repo created the package
+          # without the OCI image.source label, the push below will fail
+          # mid-step with `permission_denied: write_package`. Failing
+          # here, with a clear error and a copy-pasteable fix, is much
+          # less confusing than a half-built pipeline.
+          #
+          # Only runs for GHCR (other registries don't have this issue).
+          # The OCI label set in the Dockerfile (PR #103) prevents new
+          # mislinks; this check is a safety net for old ones.
+          set -euo pipefail
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          # Strip ghcr.io/ prefix; package name is the third path segment
+          PKG_NAME=$(echo "$IMAGE_NAME" | sed 's|^ghcr.io/||')
+          HTTP_CODE=$(curl -s -o /tmp/pkg_check.json -w "%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/orgs/${OWNER}/packages/container/${PKG_NAME}")
+          case "$HTTP_CODE" in
+            404)
+              echo "Pre-flight OK: package ${PKG_NAME} does not exist in the org namespace yet."
+              ;;
+            200)
+              echo "::error::GHCR package '${PKG_NAME}' already exists in the org namespace."
+              echo "::error::This usually means a previous run of a different (rescaffolded) repo created it without the OCI image.source label."
+              echo "::error::The current repo's GITHUB_TOKEN can't write to it -- push would fail with 'permission_denied: write_package'."
+              echo "::error::"
+              echo "::error::Recovery: delete the stale package with a token that has delete:packages scope, then re-run this job:"
+              echo "::error::  gh api -X DELETE /orgs/${OWNER}/packages/container/${PKG_NAME} -H 'Authorization: Bearer <PAT with delete:packages>'"
+              echo "::error::"
+              echo "::error::Existing package state:"
+              cat /tmp/pkg_check.json
+              exit 1
+              ;;
+            *)
+              echo "::warning::Pre-flight got unexpected HTTP ${HTTP_CODE} checking package ${PKG_NAME}. Continuing; push may fail with permission_denied: write_package."
+              cat /tmp/pkg_check.json
+              ;;
+          esac
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
+          # OCI image.source is the key to GHCR's auto-link. See PR #103.
+          # The raw block below is needed because the dollar-curly-brace
+          # syntax is also a Jinja expression; without raw, the scaffolder
+          # would try to evaluate github.repository at scaffold time.
+          build-args: |
+            IMAGE_SOURCE=https://github.com/${{ github.repository }}
+            IMAGE_URL=https://github.com/${{ github.repository }}
           tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest
+
+  # PR #104: tagged-release publishing. Runs only on `v*` tag pushes
+  # (e.g. v1.2.3, v1.2.3-rc.1). Derives the major/minor/patch from
+  # the tag and pushes the image with five labels:
+  #   :X.Y.Z       -- exact pinned version
+  #   :X.Y         -- tracks the latest X.Y patch release
+  #   :X           -- tracks the latest X major release
+  #   :<sha>       -- the immutable build (same as the main push)
+  #   :latest      -- mutable pointer to the most recent tag push
+  #
+  # Note on prereleases: `:latest` is updated on every tag push,
+  # including `v1.2.3-rc.1`. If you don't want that, push a
+  # different branch or use a downstream `:X.Y.Z-pinned` pull
+  # policy. We chose to keep `:latest` always-tag-driven rather
+  # than branching on the prerelease suffix because the
+  # alternative (two build-push-action invocations or a
+  # conditional tags: block) is significantly more complex for
+  # a marginal safety win; the trade is documented above.
+  publish-tagged:
+    name: publish (tagged release)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set image name
+        run: |
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+
+          echo "IMAGE_NAME=ghcr.io/${OWNER}/${REPO}/ala_service_modified" >> "$GITHUB_ENV"
+
+      - name: Derive version tags from the ref name
+        id: version
+        run: |
+          # github.ref_name is the tag without refs/tags/. For
+          # v1.2.3 -> "v1.2.3"; for v1.2.3-rc.1 -> "v1.2.3-rc.1".
+          VER="${{ github.ref_name }}"
+          VER_NO_V="${VER#v}"
+          if ! echo "$VER_NO_V" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Tag '${VER}' is not a valid semver (expected vX.Y.Z or vX.Y.Z-pre.N)."
+            exit 1
+          fi
+          MAJOR="${VER_NO_V%%.*}"
+          REST="${VER_NO_V#*.}"
+          MINOR="${REST%%.*}"
+          PATCH="${REST#*.}"
+          # Strip any prerelease suffix from PATCH (e.g. 3-rc.1 -> 3)
+          PATCH="${PATCH%%-*}"
+          IS_PRERELEASE="false"
+          if [[ "$VER_NO_V" == *-* ]]; then
+            IS_PRERELEASE="true"
+          fi
+          echo "version=${VER_NO_V}" >> "$GITHUB_OUTPUT"
+          echo "major=${MAJOR}" >> "$GITHUB_OUTPUT"
+          echo "minor=${MINOR}" >> "$GITHUB_OUTPUT"
+          echo "patch=${PATCH}" >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=${IS_PRERELEASE}" >> "$GITHUB_OUTPUT"
+          echo "Resolved ${VER} -> version=${VER_NO_V} major=${MAJOR} minor=${MINOR} patch=${PATCH} is_prerelease=${IS_PRERELEASE}"
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push with semver tags
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          build-args: |
+            IMAGE_SOURCE=https://github.com/${{ github.repository }}
+            IMAGE_URL=https://github.com/${{ github.repository }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+            ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.major }}.${{ steps.version.outputs.minor }}
+            ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.major }}
             ${{ env.IMAGE_NAME }}:${{ github.sha }}
             ${{ env.IMAGE_NAME }}:latest
